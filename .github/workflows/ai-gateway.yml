@@ -1,0 +1,102 @@
+# Kong AI Gateway pipeline
+#   Pull request -> kongctl plan + diff, posted as a PR comment (changes nothing)
+#   Merge to main -> kongctl apply (creates / updates, never deletes)
+#
+# Required GitHub Secrets (Settings -> Secrets and variables -> Actions):
+#   KONGCTL_DEFAULT_KONNECT_PAT   system account token (spat_...), role: AI Gateways Admin
+#   HR_API_KEY, SALES_API_KEY, USERS_API_KEY   consumer keys (same values as local .env)
+
+name: ai-gateway
+
+on:
+  pull_request:
+    paths:
+      - "ai-gateway/**"
+      - ".github/workflows/ai-gateway.yml"
+  push:
+    branches: [main]
+    paths:
+      - "ai-gateway/**"
+      - ".github/workflows/ai-gateway.yml"
+  workflow_dispatch: {}
+
+# Never run two applies at the same time
+concurrency:
+  group: ai-gateway
+  cancel-in-progress: false
+
+env:
+  KONGCTL_VERSION: "1.20.2"
+  KONNECT_REGION: "in"
+  CONFIG_FILE: "ai-gateway/ai.yml"
+  KONGCTL_NO_TELEMETRY: "true"
+  KONGCTL_DEFAULT_KONNECT_PAT: ${{ secrets.KONGCTL_DEFAULT_KONNECT_PAT }}
+  HR_API_KEY: ${{ secrets.HR_API_KEY }}
+  SALES_API_KEY: ${{ secrets.SALES_API_KEY }}
+  USERS_API_KEY: ${{ secrets.USERS_API_KEY }}
+
+jobs:
+  plan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kongctl
+        run: |
+          base="https://github.com/Kong/kongctl/releases/download/v${KONGCTL_VERSION}"
+          curl -sSLO "$base/kongctl_linux_amd64.zip"
+          curl -sSLO "$base/checksums.txt"
+          grep " kongctl_linux_amd64.zip$" checksums.txt | sha256sum -c -
+          unzip -o -q kongctl_linux_amd64.zip kongctl
+          sudo mv kongctl /usr/local/bin/kongctl
+          kongctl version
+
+      - name: Plan
+        run: kongctl plan -f "$CONFIG_FILE" --mode apply --region "$KONNECT_REGION" --output-file plan.json
+
+      - name: Diff
+        run: kongctl diff --plan plan.json --color never | tee diff.txt
+
+      - name: Comment diff on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const diff = fs.readFileSync('diff.txt', 'utf8').trim() || 'No output';
+            const body = '### Kong AI Gateway plan\n```diff\n' + diff.slice(0, 60000) + '\n```\nMerging this PR will apply these changes to Konnect.';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+  apply:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kongctl
+        run: |
+          base="https://github.com/Kong/kongctl/releases/download/v${KONGCTL_VERSION}"
+          curl -sSLO "$base/kongctl_linux_amd64.zip"
+          curl -sSLO "$base/checksums.txt"
+          grep " kongctl_linux_amd64.zip$" checksums.txt | sha256sum -c -
+          unzip -o -q kongctl_linux_amd64.zip kongctl
+          sudo mv kongctl /usr/local/bin/kongctl
+          kongctl version
+
+      - name: Plan (shown in the job log)
+        run: |
+          kongctl plan -f "$CONFIG_FILE" --mode apply --region "$KONNECT_REGION" --output-file plan.json
+          kongctl diff --plan plan.json --color never
+
+      - name: Apply
+        run: kongctl apply --plan plan.json --region "$KONNECT_REGION" --auto-approve

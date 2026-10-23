@@ -1,0 +1,187 @@
+# Kong AI Gateway – providers and models as code (kongctl declarative format)
+#
+# Env:     . .\scripts\load-env.ps1      (loads Konnect token + consumer keys from .env)
+# Set-ExecutionPolicy -Scope Process Bypass
+# . .\scripts\load-env.ps1
+
+# Preview: kongctl plan -f ai-gateway\ai.yml --mode apply --region in --output-file plan.json
+#          kongctl diff --plan plan.json
+# Apply:   kongctl apply -f ai-gateway\ai.yml --region in   (creates / updates; never deletes)
+#
+# The gateway itself (ai-gateway-test), the data plane and the vault secret were
+# created in the Konnect UI. "_external" points at that existing gateway, so this
+# file only manages what is listed below: providers, auth strategy, consumers,
+# consumer groups and models (with their access rules).
+#
+# Secrets: never put real keys here. AI keys = vault addresses; consumer keys =
+# !secret {source: !env ...}, filled from .env (laptop) or GitHub Secrets (CI).
+# The vault secret groq-api-key holds the full header value: "Bearer gsk_..."
+
+ai_gateways:
+  - ref: ai-gateway-test
+    name: ai-gateway-test
+    display_name: ai-gateway-test
+    _external:
+      selector:
+        matchFields:
+          name: ai-gateway-test
+
+    # ---------- Providers: one per AI company / key ----------
+    model_providers:
+      - ref: groq-cli
+        name: groq-cli
+        display_name: groq-cli
+        type: openai                      # Groq speaks the OpenAI format
+        config:
+          auth:
+            type: basic
+            headers:
+              - name: Authorization
+                value: "{vault://konnectvault/groq-api-key}"
+
+    # ---------- Auth strategy: HOW callers prove who they are ----------
+    auth_strategies:
+      - ref: key-auth-cli
+        name: key-auth-cli
+        display_name: key-auth-cli
+        type: key-auth
+        config:
+          key_names:
+            - apikey                      # apps send the key in header "apikey"
+          key_in_header: true
+          key_in_query: false
+          key_in_body: false
+          hide_credentials: true          # Kong strips the key before calling the AI
+
+    # ---------- Consumers: one per team / app ----------
+    # Key values come from environment variables, never from this file:
+    #   $env:HR_API_KEY / $env:SALES_API_KEY / $env:USERS_API_KEY
+    consumers:
+      - ref: team-hr-cli
+        name: team-hr-cli
+        display_name: team-hr-cli
+        custom_id: team-hr-cli
+        type: api-key
+        credentials:
+          - ref: team-hr-key-cli
+            name: team-hr-key-cli
+            display_name: team-hr-key-cli
+            type: api-key
+            api_key: !secret {source: !env HR_API_KEY}
+            ttl: 0
+      - ref: team-sales-cli
+        name: team-sales-cli
+        display_name: team-sales-cli
+        custom_id: team-sales-cli
+        type: api-key
+        credentials:
+          - ref: team-sales-key-cli
+            name: team-sales-key-cli
+            display_name: team-sales-key-cli
+            type: api-key
+            api_key: !secret {source: !env SALES_API_KEY}
+            ttl: 0
+      - ref: team-users-cli
+        name: team-users-cli
+        display_name: team-users-cli
+        custom_id: team-users-cli
+        type: api-key
+        credentials:
+          - ref: team-users-key-cli
+            name: team-users-key-cli
+            display_name: team-users-key-cli
+            type: api-key
+            api_key: !secret {source: !env USERS_API_KEY}
+            ttl: 0
+
+    # ---------- Consumer groups: teams that share access / limits ----------
+    consumer_groups:
+      - ref: hr-group
+        name: hr-group
+        display_name: hr-group
+        consumers:
+          - !ref team-hr-cli#name
+      - ref: sales-group
+        name: sales-group
+        display_name: sales-group
+        consumers:
+          - !ref team-sales-cli#name
+
+    # ---------- Models: one per AI API ----------
+    models:
+      - ref: groq-cli-model
+        name: groq-cli-model              # apps send "model": "groq-cli-model"
+        display_name: groq-cli-model
+        type: model
+        enabled: true
+        formats:
+          - type: openai
+        capabilities:
+          - generate                      # = Chat completions in the UI
+        targets:
+          - name: openai/gpt-oss-20b      # real model name at Groq
+            provider: groq-cli
+            config:
+              type: openai
+              upstream_url: https://api.groq.com/openai/v1/chat/completions
+              max_tokens: 1500
+              temperature: 0.3
+        config:
+          route:
+            paths:
+              - /
+
+      - ref: groq-smart
+        name: groq-smart                  # apps send "model": "groq-smart"
+        display_name: groq-smart
+        type: model
+        enabled: true
+        access:                           # key required + only HR may use this model
+          auth_strategies:
+            - key-auth-cli
+          acls:
+            allow:
+              - hr-group
+        formats:
+          - type: openai
+        capabilities:
+          - generate
+        targets:
+          - name: openai/gpt-oss-120b     # bigger model, same Groq key
+            provider: groq-cli
+            config:
+              type: openai
+              upstream_url: https://api.groq.com/openai/v1/chat/completions
+              max_tokens: 1500
+              temperature: 0.3
+              input_cost: 0.15            # $ per 1M tokens (Groq price)
+              output_cost: 0.60
+        config:
+          route:
+            paths:
+              - /secure                     # own route: models sharing "/" share auth/ACL too
+                                          # call: POST http://localhost:8000/secure/chat/completions
+
+      - ref: groq-qwen
+        name: groq-qwen                   # apps send "model": "groq-qwen"
+        display_name: groq-qwen
+        type: model
+        enabled: true
+        formats:
+          - type: openai
+        capabilities:
+          - generate
+        targets:
+          - name: qwen/qwen3.8-27b        # different AI family (Groq preview model)
+            provider: groq-cli
+            config:
+              type: openai
+              upstream_url: https://api.groq.com/openai/v1/chat/completions
+              max_tokens: 1500
+              temperature: 0.3
+              input_cost: 0.80
+              output_cost: 4.00
+        config:
+          route:
+            paths:
+              - /
